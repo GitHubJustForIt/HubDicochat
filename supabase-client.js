@@ -1,114 +1,128 @@
 // ============================================================================
 // supabase-client.js
-// Wraps Supabase (auth, database, realtime, storage) for the messenger.
-// The anon key is meant to be public — access is controlled by Row Level
-// Security (RLS) policies configured in your Supabase project (see
-// README.md for the SQL to run once, in the SQL editor).
+// STORAGE-ONLY BACKEND. No Postgres tables, no RLS policies to configure.
+// Every piece of app data (profiles, contacts, dms, messages, hubs, roles,
+// members, channels, webhooks) is just a JSON file written into the
+// "attachments" bucket. Supabase Auth is still used for login/password only.
 // ============================================================================
 
 const SUPABASE_URL = "https://csscdfzjpygrfmeirljd.supabase.co";
 const SUPABASE_ANON_KEY =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNzc2NkZnpqcHlncmZtZWlybGpkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI1MjQwOTUsImV4cCI6MjA5ODEwMDA5NX0.uiOi2bVMNANk7vSiJ7DOe5WD9rAMeQOKNUk2-G4_Lck";
+const BUCKET = "attachments";
 
-// Loaded from the Supabase JS CDN bundle included in index.html as `supabase`.
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { persistSession: true, autoRefreshToken: true },
 });
+
+// ------------------------------------------------------- raw bucket i/o ---
+async function readJSON(path) {
+  const { data, error } = await sb.storage.from(BUCKET).download(path);
+  if (error) return null; // file doesn't exist yet — normal, not fatal
+  try {
+    return JSON.parse(await data.text());
+  } catch (_) {
+    return null;
+  }
+}
+
+async function writeJSON(path, obj) {
+  const blob = new Blob([JSON.stringify(obj)], { type: "application/json" });
+  const { error } = await sb.storage.from(BUCKET).upload(path, blob, {
+    upsert: true,
+    contentType: "application/json",
+  });
+  if (error) throw error;
+  return obj;
+}
+
+async function listDir(prefix) {
+  const { data, error } = await sb.storage
+    .from(BUCKET)
+    .list(prefix, { limit: 1000, sortBy: { column: "name", order: "asc" } });
+  if (error) return [];
+  return (data || []).filter((e) => e.name && e.name !== ".emptyFolderPlaceholder");
+}
+
+const uid = () => crypto.randomUUID();
+const sortedPair = (a, b) => [a, b].sort();
+const dmIdOf = (a, b) => sortedPair(a, b).join("__");
 
 const DB = {
   // ---------------------------------------------------------------- auth --
   async signUp({ email, username, password }) {
     username = username.trim().toLowerCase();
-    const { data: existing } = await sb
-      .from("profiles")
-      .select("id")
-      .eq("username", username)
-      .maybeSingle();
-    if (existing) throw new Error("Dieser Benutzername ist bereits vergeben.");
+    if (await readJSON(`usernames/${username}.json`)) {
+      throw new Error("Dieser Benutzername ist bereits vergeben.");
+    }
 
     const { data, error } = await sb.auth.signUp({ email, password });
     if (error) throw error;
+    const userId = data.user.id;
 
-    // Generate this device's E2EE identity keypair now (safe: local only)
-    // and stash the intended username so we can finish setting up the
-    // profile once a real session exists.
+    // Local-only E2EE identity keypair — private key never leaves this browser.
     const keys = await Crypto.generateIdentityKeyPair();
-    await Crypto.storePrivateKey(data.user.id, keys.privateKeyJwk);
-    localStorage.setItem(
-      "pending_profile",
-      JSON.stringify({ id: data.user.id, username, email, publicKeyJwk: keys.publicKeyJwk })
-    );
+    await Crypto.storePrivateKey(userId, keys.privateKeyJwk);
 
-    // If email confirmation is OFF, signUp() already returns an active
-    // session, so we can create the profile row right now (auth.uid() is
-    // set). If confirmation is ON, there's no session yet — RLS would
-    // reject the insert, so we skip it and finish on first sign-in instead.
-    const { data: sessionData } = await sb.auth.getSession();
-    if (sessionData.session) {
-      await DB._finishProfileSetup();
-      return { user: data.user, needsEmailConfirmation: false };
-    }
-    return { user: data.user, needsEmailConfirmation: true };
-  },
+    // Everything below is a plain file write — no session/RLS required,
+    // the bucket is public, so this works instantly either way.
+    await writeJSON(`usernames/${username}.json`, { userId });
+    await writeJSON(`profiles/${userId}.json`, {
+      id: userId,
+      username,
+      email,
+      public_key: JSON.stringify(keys.publicKeyJwk),
+      status: "online",
+      created_at: new Date().toISOString(),
+    });
+    await writeJSON(`contacts/${userId}.json`, []);
 
-  // Creates the `profiles` row from data stashed during signUp. Only ever
-  // called while a real session exists, so it satisfies the `auth.uid() = id`
-  // RLS policy on insert.
-  async _finishProfileSetup() {
-    const pending = localStorage.getItem("pending_profile");
-    if (!pending) return;
-    const { id, username, email, publicKeyJwk } = JSON.parse(pending);
-
-    const { data: sessionData } = await sb.auth.getSession();
-    if (!sessionData.session || sessionData.session.user.id !== id) return; // not this account's pending signup
-
-    const { data: alreadyExists } = await sb.from("profiles").select("id").eq("id", id).maybeSingle();
-    if (!alreadyExists) {
-      const { error } = await sb.from("profiles").insert({
-        id, username, email,
-        public_key: JSON.stringify(publicKeyJwk),
-        status: "online",
-      });
-      if (error) throw error;
-    }
-    localStorage.removeItem("pending_profile");
+    // data.session is only set if email confirmation is OFF in your
+    // Supabase Auth settings — otherwise the user must confirm first.
+    return { user: data.user, needsEmailConfirmation: !data.session };
   },
 
   async signIn({ identifier, password }) {
     let email = identifier.trim();
     if (!email.includes("@")) {
-      const { data: profile, error } = await sb
-        .from("profiles")
-        .select("email")
-        .eq("username", email.toLowerCase())
-        .maybeSingle();
-      if (error || !profile) throw new Error("Benutzer nicht gefunden.");
+      const rec = await readJSON(`usernames/${email.toLowerCase()}.json`);
+      if (!rec) throw new Error("Benutzer nicht gefunden.");
+      const profile = await readJSON(`profiles/${rec.userId}.json`);
+      if (!profile) throw new Error("Benutzer nicht gefunden.");
       email = profile.email;
     }
+
     const { data, error } = await sb.auth.signInWithPassword({ email, password });
     if (error) throw error;
 
-    // If this login is completing a signup that was waiting on email
-    // confirmation, finish creating the profile row now that a session exists.
-    await DB._finishProfileSetup();
-
-    // Make sure this device has a local identity key; if not, generate one
-    // and republish (first login on a new device).
+    // First login on a new device: generate + publish a fresh identity key.
     const existingKey = await Crypto.loadPrivateKey(data.user.id);
     if (!existingKey) {
       const keys = await Crypto.generateIdentityKeyPair();
       await Crypto.storePrivateKey(data.user.id, keys.privateKeyJwk);
-      await sb
-        .from("profiles")
-        .update({ public_key: JSON.stringify(keys.publicKeyJwk) })
-        .eq("id", data.user.id);
+      const profile = await readJSON(`profiles/${data.user.id}.json`);
+      if (profile) {
+        profile.public_key = JSON.stringify(keys.publicKeyJwk);
+        await writeJSON(`profiles/${data.user.id}.json`, profile);
+      }
     }
-    await sb.from("profiles").update({ status: "online" }).eq("id", data.user.id);
+
+    const profile = await readJSON(`profiles/${data.user.id}.json`);
+    if (profile) {
+      profile.status = "online";
+      await writeJSON(`profiles/${data.user.id}.json`, profile);
+    }
     return data.user;
   },
 
   async signOut(userId) {
-    if (userId) await sb.from("profiles").update({ status: "offline" }).eq("id", userId);
+    if (userId) {
+      const profile = await readJSON(`profiles/${userId}.json`);
+      if (profile) {
+        profile.status = "offline";
+        await writeJSON(`profiles/${userId}.json`, profile);
+      }
+    }
     await sb.auth.signOut();
   },
 
@@ -119,19 +133,15 @@ const DB = {
 
   // ------------------------------------------------------------ profiles --
   async getProfile(userId) {
-    const { data, error } = await sb.from("profiles").select("*").eq("id", userId).single();
-    if (error) throw error;
-    return data;
+    const profile = await readJSON(`profiles/${userId}.json`);
+    if (!profile) throw new Error("Profil nicht gefunden.");
+    return profile;
   },
 
   async findByUsername(username) {
-    const { data, error } = await sb
-      .from("profiles")
-      .select("*")
-      .eq("username", username.trim().toLowerCase())
-      .maybeSingle();
-    if (error) throw error;
-    return data;
+    const rec = await readJSON(`usernames/${username.trim().toLowerCase()}.json`);
+    if (!rec) return null;
+    return readJSON(`profiles/${rec.userId}.json`);
   },
 
   // ------------------------------------------------------------ contacts --
@@ -139,161 +149,141 @@ const DB = {
     const contact = await DB.findByUsername(contactUsername);
     if (!contact) throw new Error("Kein Nutzer mit diesem Namen gefunden.");
     if (contact.id === ownerId) throw new Error("Du kannst dich nicht selbst hinzufügen.");
-    const { error } = await sb
-      .from("contacts")
-      .insert({ owner_id: ownerId, contact_id: contact.id });
-    if (error && error.code !== "23505") throw error; // ignore duplicate
+    const list = (await readJSON(`contacts/${ownerId}.json`)) || [];
+    if (!list.includes(contact.id)) list.push(contact.id);
+    await writeJSON(`contacts/${ownerId}.json`, list);
     return contact;
   },
 
   async listContacts(ownerId) {
-    const { data, error } = await sb
-      .from("contacts")
-      .select("contact_id, profiles:contact_id(id, username, status, public_key, avatar_url)")
-      .eq("owner_id", ownerId);
-    if (error) throw error;
-    return data.map((r) => r.profiles);
+    const ids = (await readJSON(`contacts/${ownerId}.json`)) || [];
+    const profiles = await Promise.all(ids.map((id) => readJSON(`profiles/${id}.json`)));
+    return profiles.filter(Boolean);
   },
 
   // ------------------------------------------------------------------ dm --
   async getOrCreateDM(userA, userB) {
-    const [u1, u2] = [userA, userB].sort();
-    const { data: existing } = await sb
-      .from("dms")
-      .select("*")
-      .eq("user1", u1)
-      .eq("user2", u2)
-      .maybeSingle();
-    if (existing) return existing;
-    const { data, error } = await sb
-      .from("dms")
-      .insert({ user1: u1, user2: u2 })
-      .select()
-      .single();
-    if (error) throw error;
-    return data;
+    const id = dmIdOf(userA, userB);
+    let meta = await readJSON(`dms/${id}/meta.json`);
+    if (!meta) {
+      const [user1, user2] = sortedPair(userA, userB);
+      meta = { id, user1, user2, created_at: new Date().toISOString() };
+      await writeJSON(`dms/${id}/meta.json`, meta);
+    }
+    return meta;
   },
 
   // ------------------------------------------------------------ messages --
-  // Only ciphertext + metadata ever touches the server (E2EE — see crypto.js).
+  // Only ciphertext + metadata is ever written — the bucket never sees plaintext.
   async storeMessage({ dmId, channelId, senderId, ciphertext, iv, type, fileMeta }) {
-    const { error } = await sb.from("messages").insert({
-      dm_id: dmId || null,
-      channel_id: channelId || null,
+    const id = uid();
+    const msg = {
+      id,
       sender_id: senderId,
-      ciphertext,
-      iv,
+      ciphertext: ciphertext || "",
+      iv: iv || "",
       type: type || "text",
       file_meta: fileMeta || null,
-    });
-    if (error) throw error;
+      created_at: new Date().toISOString(),
+    };
+    const base = dmId ? `dms/${dmId}/messages` : `channels/${channelId}/messages`;
+    // Timestamp-prefixed filename keeps a plain alphabetical sort == chronological order.
+    await writeJSON(`${base}/${Date.now()}-${id}.json`, msg);
+    return msg;
   },
 
   async loadHistory({ dmId, channelId }, limit = 50) {
-    let q = sb.from("messages").select("*").order("created_at", { ascending: true }).limit(limit);
-    q = dmId ? q.eq("dm_id", dmId) : q.eq("channel_id", channelId);
-    const { data, error } = await q;
-    if (error) throw error;
-    return data;
+    const base = dmId ? `dms/${dmId}/messages` : `channels/${channelId}/messages`;
+    const entries = (await listDir(base)).sort((a, b) => a.name.localeCompare(b.name)).slice(-limit);
+    const msgs = await Promise.all(entries.map((e) => readJSON(`${base}/${e.name}`)));
+    return msgs.filter(Boolean);
   },
 
   // -------------------------------------------------------------- hubs* ---
-  // ("Hub" = this app's rebranded equivalent of a Discord "server")
   async createHub(ownerId, name) {
-    const { data: hub, error } = await sb
-      .from("hubs")
-      .insert({ name, owner_id: ownerId })
-      .select()
-      .single();
-    if (error) throw error;
+    const hubId = uid();
+    const hub = { id: hubId, name, owner_id: ownerId, icon_url: null, created_at: new Date().toISOString() };
+    await writeJSON(`hubs/${hubId}/meta.json`, hub);
 
-    await sb.from("hub_roles").insert({ hub_id: hub.id, name: "Mitglied", color: "#99AAB5", permissions: {} });
-    const { data: everyoneRole } = await sb
-      .from("hub_roles")
-      .select("id")
-      .eq("hub_id", hub.id)
-      .eq("name", "Mitglied")
-      .single();
+    const roleId = uid();
+    await writeJSON(`hubs/${hubId}/roles/${roleId}.json`, {
+      id: roleId, hub_id: hubId, name: "Mitglied", color: "#99AAB5", permissions: {},
+    });
+    await writeJSON(`hubs/${hubId}/members/${ownerId}.json`, { user_id: ownerId, role_id: roleId });
+    await writeJSON(`index/hubs-by-user/${ownerId}/${hubId}.json`, {});
 
-    await sb.from("hub_members").insert({ hub_id: hub.id, user_id: ownerId, role_id: everyoneRole.id });
-    await sb.from("hub_channels").insert([
-      { hub_id: hub.id, name: "allgemein", type: "text" },
-      { hub_id: hub.id, name: "Sprachchat", type: "voice" },
-    ]);
+    const ch1 = uid(), ch2 = uid();
+    await writeJSON(`hubs/${hubId}/channels/${ch1}.json`, { id: ch1, hub_id: hubId, name: "allgemein", type: "text" });
+    await writeJSON(`hubs/${hubId}/channels/${ch2}.json`, { id: ch2, hub_id: hubId, name: "Sprachchat", type: "voice" });
+
     return hub;
   },
 
   async listHubs(userId) {
-    const { data, error } = await sb
-      .from("hub_members")
-      .select("hub_id, hubs:hub_id(id, name, icon_url, owner_id)")
-      .eq("user_id", userId);
-    if (error) throw error;
-    return data.map((r) => r.hubs);
+    const entries = await listDir(`index/hubs-by-user/${userId}`);
+    const hubs = await Promise.all(
+      entries.map((e) => readJSON(`hubs/${e.name.replace(/\.json$/, "")}/meta.json`))
+    );
+    return hubs.filter(Boolean);
   },
 
   async listChannels(hubId) {
-    const { data, error } = await sb.from("hub_channels").select("*").eq("hub_id", hubId).order("created_at");
-    if (error) throw error;
-    return data;
+    const entries = await listDir(`hubs/${hubId}/channels`);
+    const channels = await Promise.all(entries.map((e) => readJSON(`hubs/${hubId}/channels/${e.name}`)));
+    return channels.filter(Boolean);
   },
 
   async inviteToHub(hubId, username) {
     const user = await DB.findByUsername(username);
     if (!user) throw new Error("Nutzer nicht gefunden.");
-    const { data: role } = await sb
-      .from("hub_roles")
-      .select("id")
-      .eq("hub_id", hubId)
-      .eq("name", "Mitglied")
-      .single();
-    const { error } = await sb
-      .from("hub_members")
-      .insert({ hub_id: hubId, user_id: user.id, role_id: role?.id || null });
-    if (error && error.code !== "23505") throw error;
+    const roleEntries = await listDir(`hubs/${hubId}/roles`);
+    const defaultRole = roleEntries[0] ? await readJSON(`hubs/${hubId}/roles/${roleEntries[0].name}`) : null;
+    await writeJSON(`hubs/${hubId}/members/${user.id}.json`, { user_id: user.id, role_id: defaultRole?.id || null });
+    await writeJSON(`index/hubs-by-user/${user.id}/${hubId}.json`, {});
     return user;
   },
 
   async listHubMembers(hubId) {
-    const { data, error } = await sb
-      .from("hub_members")
-      .select("user_id, profiles:user_id(id, username, status), hub_roles:role_id(name, color)")
-      .eq("hub_id", hubId);
-    if (error) throw error;
-    return data;
+    const entries = await listDir(`hubs/${hubId}/members`);
+    const members = await Promise.all(
+      entries.map(async (e) => {
+        const m = await readJSON(`hubs/${hubId}/members/${e.name}`);
+        if (!m) return null;
+        const profile = await readJSON(`profiles/${m.user_id}.json`);
+        const role = m.role_id ? await readJSON(`hubs/${hubId}/roles/${m.role_id}.json`) : null;
+        return profile ? { user_id: m.user_id, profiles: profile, hub_roles: role } : null;
+      })
+    );
+    return members.filter(Boolean);
   },
 
   async createWebhook(channelId, name) {
-    const token = crypto.randomUUID().replace(/-/g, "");
-    const { data, error } = await sb
-      .from("webhooks")
-      .insert({ channel_id: channelId, name, token })
-      .select()
-      .single();
-    if (error) throw error;
-    return data;
+    const id = uid();
+    const token = uid().replace(/-/g, "");
+    const hook = { id, channel_id: channelId, name, token, created_at: new Date().toISOString() };
+    await writeJSON(`channels/${channelId}/webhooks/${id}.json`, hook);
+    return hook;
   },
 
   async listWebhooks(channelId) {
-    const { data, error } = await sb.from("webhooks").select("*").eq("channel_id", channelId);
-    if (error) throw error;
-    return data;
+    const entries = await listDir(`channels/${channelId}/webhooks`);
+    const hooks = await Promise.all(entries.map((e) => readJSON(`channels/${channelId}/webhooks/${e.name}`)));
+    return hooks.filter(Boolean);
   },
 
   // --------------------------------------------------------------- files --
   async uploadFile(userId, file) {
-    const path = `${userId}/${Date.now()}-${file.name}`;
-    const { error } = await sb.storage.from("attachments").upload(path, file, {
-      cacheControl: "3600",
-      upsert: false,
-    });
+    const path = `uploads/${userId}/${Date.now()}-${file.name}`;
+    const { error } = await sb.storage.from(BUCKET).upload(path, file, { cacheControl: "3600", upsert: false });
     if (error) throw error;
-    const { data } = sb.storage.from("attachments").getPublicUrl(path);
+    const { data } = sb.storage.from(BUCKET).getPublicUrl(path);
     return { path, url: data.publicUrl, name: file.name, size: file.size, mime: file.type };
   },
 
   // ------------------------------------------------------------ realtime --
-  // Used for presence, typing indicators and WebRTC signaling relay.
+  // Presence, typing indicators and WebRTC signaling still use Supabase
+  // Realtime channels — these are independent of Storage/Postgres and need
+  // no setup at all.
   channel(name) {
     return sb.channel(name, { config: { broadcast: { self: false }, presence: { key: name } } });
   },
