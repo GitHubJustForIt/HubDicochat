@@ -168,6 +168,53 @@ class PeerLink {
     return this.localStream;
   }
 
+  // Swaps the outgoing video track for a screen-share track using
+  // replaceTrack, so the peer connection doesn't need renegotiation.
+  // Call again (or let the browser's native "stop sharing" fire) to revert.
+  async toggleScreenShare(onEnded) {
+    if (this._sharingScreen) {
+      await this._stopScreenShare();
+      return false;
+    }
+    const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    const screenTrack = screenStream.getVideoTracks()[0];
+    const sender = this.pc.getSenders().find((s) => s.track && s.track.kind === "video");
+
+    this._originalVideoTrack = sender ? sender.track : null;
+    this._screenStream = screenStream;
+
+    if (sender) {
+      await sender.replaceTrack(screenTrack);
+    } else {
+      this.pc.addTrack(screenTrack, screenStream);
+    }
+    if (this.localStream) {
+      // Keep localStream's audio, swap in the screen track for local preview.
+      this.localStream.getVideoTracks().forEach((t) => this.localStream.removeTrack(t));
+      this.localStream.addTrack(screenTrack);
+    }
+    this._sharingScreen = true;
+    screenTrack.onended = () => this._stopScreenShare().then(() => onEnded && onEnded());
+    return true;
+  }
+
+  async _stopScreenShare() {
+    if (!this._sharingScreen) return;
+    const sender = this.pc.getSenders().find((s) => s.track && s.track.kind === "video");
+    if (this._originalVideoTrack && sender) {
+      await sender.replaceTrack(this._originalVideoTrack);
+      if (this.localStream) {
+        this.localStream.getVideoTracks().forEach((t) => this.localStream.removeTrack(t));
+        this.localStream.addTrack(this._originalVideoTrack);
+      }
+    } else if (sender) {
+      sender.track && sender.track.stop();
+    }
+    if (this._screenStream) this._screenStream.getTracks().forEach((t) => t.stop());
+    this._sharingScreen = false;
+    this._screenStream = null;
+  }
+
   async recordVoiceMessage() {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const recorder = new MediaRecorder(stream);
@@ -187,6 +234,7 @@ class PeerLink {
   }
 
   close() {
+    if (this._screenStream) this._screenStream.getTracks().forEach((t) => t.stop());
     if (this.localStream) this.localStream.getTracks().forEach((t) => t.stop());
     if (this.dc) this.dc.close();
     if (this.pc) this.pc.close();
