@@ -185,37 +185,27 @@
 
 </div>
 
-<div id="boot-error" class="boot-error hidden">
-  ⚠️ Die Supabase-Bibliothek konnte nicht geladen werden (CDN-Skript blockiert oder keine Internetverbindung).
-  Bitte Internetverbindung/Adblocker prüfen und die Seite neu laden. Falls du die Datei per Doppelklick
-  (file://) geöffnet hast, starte stattdessen einen lokalen Server, z.B. <code>python3 -m http.server</code>.
-</div>
+<div id="boot-error" class="boot-error hidden"></div>
 
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script>
-  if (typeof supabase === "undefined") {
-    document.getElementById("boot-error").classList.remove("hidden");
-    document.getElementById("auth-screen").classList.add("hidden");
-    throw new Error("Supabase SDK failed to load from CDN.");
-  }
   function showLoadError(src) {
     const box = document.getElementById("boot-error");
     box.innerHTML = `⚠️ Datei konnte nicht geladen werden: <code>${src}</code><br>
-      Prüfe im Hosting (z.B. Render → Deploy → Logs / Files), ob diese Datei mit exakt diesem
-      Namen (Groß-/Kleinschreibung beachten!) im selben Ordner wie index.html liegt und mit hochgeladen wurde.`;
+      Prüfe im Hosting, ob diese Datei mit exakt diesem Namen (Groß-/Kleinschreibung beachten!)
+      im selben Ordner wie index.html liegt und mit hochgeladen wurde.`;
     box.classList.remove("hidden");
     document.getElementById("auth-screen").classList.add("hidden");
   }
   window.addEventListener("error", (e) => {
     if (!e.filename || !e.filename.endsWith(".js")) return;
     const box = document.getElementById("boot-error");
-    if (!box.classList.contains("hidden")) return; // don't overwrite an existing message
+    if (!box.classList.contains("hidden")) return;
     box.innerHTML = `⚠️ Fehler in <code>${e.filename.split("/").pop()}</code> Zeile ${e.lineno}:<br>${e.message}`;
     box.classList.remove("hidden");
     document.getElementById("auth-screen").classList.add("hidden");
   });
 </script>
-<script src="supabase-client.js" onerror="showLoadError('supabase-client.js')"></script>
+<script src="db-client.js" onerror="showLoadError('db-client.js')"></script>
 <script src="crypto.js" onerror="showLoadError('crypto.js')"></script>
 <script src="webrtc.js" onerror="showLoadError('webrtc.js')"></script>
 <script src="app.js" onerror="showLoadError('app.js')"></script>
