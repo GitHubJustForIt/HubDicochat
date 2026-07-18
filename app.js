@@ -49,10 +49,16 @@ $("#signup-submit").onclick = async () => {
     return;
   }
   try {
-    const user = await DB.signUp({ email, username, password });
-    state.user = user;
+    const result = await DB.signUp({ email, username, password });
+    if (result.needsEmailConfirmation) {
+      $("#signup-error").style.color = "var(--accent)";
+      $("#signup-error").textContent = "Fast fertig! Bitte bestätige deine E-Mail-Adresse über den Link, den wir dir geschickt haben, und melde dich danach an.";
+      return;
+    }
+    state.user = result.user;
     await enterApp();
   } catch (e) {
+    $("#signup-error").style.color = "";
     $("#signup-error").textContent = e.message || "Registrierung fehlgeschlagen.";
   }
 };
