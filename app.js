@@ -28,7 +28,7 @@ const el = (tag, cls, html) => {
 
 // -------------------------------------------------------------- bootstrap --
 (async function init() {
-  const session = await DB.getSession();
+  const session = await DB.getSession(); // reads localStorage now, not Supabase
   if (session) {
     state.user = session.user;
     await enterApp();
@@ -49,13 +49,8 @@ $("#signup-submit").onclick = async () => {
     return;
   }
   try {
-    const result = await DB.signUp({ email, username, password });
-    if (result.needsEmailConfirmation) {
-      $("#signup-error").style.color = "var(--accent)";
-      $("#signup-error").textContent = "Fast fertig! Bitte bestätige deine E-Mail-Adresse über den Link, den wir dir geschickt haben, und melde dich danach an.";
-      return;
-    }
-    state.user = result.user;
+    const user = await DB.signUp({ email, username, password });
+    state.user = user;
     await enterApp();
   } catch (e) {
     $("#signup-error").style.color = "";
@@ -242,16 +237,17 @@ function wireComposer() {
     if (!text) return;
     input.value = "";
 
-    const link = currentLink();
-    if (!link) return;
-    const { ciphertext, iv, id } = await link.sendText(text);
-    appendMessage({ mine: true, text, author: "Du" });
-    await DB.storeMessage({
-      dmId: state.activeDM?.id,
-      channelId: state.activeChannel?.id,
-      senderId: state.user.id,
-      ciphertext, iv, type: "text",
-    });
+    if (state.activeView === "dms") {
+      const link = currentLink();
+      if (!link) return;
+      const { ciphertext, iv } = await link.sendText(text);
+      appendMessage({ mine: true, text, author: "Du" });
+      await DB.storeMessage({ dmId: state.activeDM?.id, senderId: state.user.id, ciphertext, iv, type: "text" });
+    } else if (state.activeView === "hub" && state.activeChannel) {
+      appendMessage({ mine: true, text, author: "Du" });
+      const msg = await DB.storeMessage({ channelId: state.activeChannel.id, senderId: state.user.id, ciphertext: text, iv: "", type: "text" });
+      state._seenChannelMsgIds && state._seenChannelMsgIds.add(msg.id); // don't re-render our own message from the next poll
+    }
   });
 
   $("#btn-attach").onclick = () => $("#file-input").click();
@@ -360,13 +356,24 @@ function hangUp() {
 }
 
 // -------------------------------------------------------------- presence --
+// No realtime push service anymore — just refresh contact statuses
+// periodically by re-reading their profiles from the KV store.
 function subscribePresence() {
-  state.presenceChannel = DB.channel("presence:global");
-  state.presenceChannel.on("presence", { event: "sync" }, () => refreshContacts());
-  state.presenceChannel.subscribe(async (status) => {
-    if (status === "SUBSCRIBED") await state.presenceChannel.track({ user_id: state.user.id });
+  if (state._presenceTimer) clearInterval(state._presenceTimer);
+  state._presenceTimer = setInterval(refreshContacts, 12000);
+
+  // Best-effort: mark ourselves offline when the tab closes. Not fully
+  // reliable (no guaranteed delivery on unload) but better than nothing.
+  window.addEventListener("beforeunload", () => {
+    if (!state.user) return;
+    const body = JSON.stringify({ value: { ...state.profile, status: "offline" } });
+    fetch(`${KV_API}/kv/${encodeURIComponent("profile:" + state.user.id)}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
+      body,
+      keepalive: true,
+    }).catch(() => {});
   });
-  window.addEventListener("beforeunload", () => DB.signOut.length && null);
 }
 
 // ---------------------------------------------------------------- hubs ---
@@ -452,31 +459,33 @@ $("#webhook-submit").onclick = async () => {
 };
 
 async function openChannel(hub, channel) {
+  if (state._channelPollTimer) clearInterval(state._channelPollTimer);
   state.activeChannel = channel;
   $("#chat-title").textContent = `# ${channel.name}`;
   $("#chat-subtitle").textContent = hub.name;
   $("#messages").innerHTML = "";
-  // Group text uses a broadcast realtime channel as the P2P mesh signaling +
-  // relay bus (each member's browser encrypts with the shared Hub key from
-  // crypto.js before broadcasting — server only relays/stores ciphertext).
-  const rt = DB.channel(`hub-channel:${channel.id}`);
-  rt.on("broadcast", { event: "msg" }, ({ payload }) => {
-    if (payload.senderId === state.user.id) return;
-    appendMessage({ mine: false, text: payload.text, author: payload.author });
-  });
-  rt.subscribe();
-  state._hubChannelRT = rt;
 
-  $("#composer").onsubmit = null; // channel send handled below without E2EE key mgmt in this scaffold
-  $("#composer").addEventListener("submit", async function handler(e) {
-    e.preventDefault();
-    const input = $("#composer-input");
-    const text = input.value.trim();
-    if (!text) return;
-    input.value = "";
-    appendMessage({ mine: true, text, author: "Du" });
-    rt.send({ type: "broadcast", event: "msg", payload: { senderId: state.user.id, author: state.profile.username, text } });
-  }, { once: false });
+  const members = await DB.listHubMembers(hub.id);
+  state.activeHubMemberNames = {};
+  members.forEach((m) => (state.activeHubMemberNames[m.user_id] = m.profiles.username));
+
+  // No push/broadcast service anymore — poll the channel's message list in
+  // the KV store for anything new. Group chat here is relayed in plaintext
+  // through the KV store (see README "honest limitations": real E2EE group
+  // messaging needs the group-key wrapping already stubbed in crypto.js).
+  state._seenChannelMsgIds = new Set();
+  const poll = async () => {
+    const history = await DB.loadHistory({ channelId: channel.id }, 50);
+    for (const msg of history) {
+      if (state._seenChannelMsgIds.has(msg.id)) continue;
+      state._seenChannelMsgIds.add(msg.id);
+      if (msg.type !== "text") continue;
+      const mine = msg.sender_id === state.user.id;
+      appendMessage({ mine, text: msg.ciphertext, author: mine ? "Du" : state.activeHubMemberNames[msg.sender_id] || "Unbekannt" });
+    }
+  };
+  await poll();
+  state._channelPollTimer = setInterval(poll, 2500);
 }
 
 // -------------------------------------------------------------- modals ---
