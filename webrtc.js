@@ -1,9 +1,10 @@
 // ============================================================================
 // webrtc.js
-// Peer-to-peer transport. Supabase Realtime is used only as a "signaling
-// relay" (to exchange SDP offers/answers and ICE candidates) — once the
-// connection is up, chat text, files, voice and video all flow directly
-// between the two browsers (true P2P), encrypted end-to-end via crypto.js.
+// Peer-to-peer transport. Signaling (the SDP offer/answer + ICE candidate
+// exchange needed to open a WebRTC connection) is relayed through the same
+// KV hub as everything else, via short polling — no Supabase, no other
+// service involved. Once connected, chat text, files, voice and video all
+// flow directly between the two browsers, encrypted end-to-end via crypto.js.
 // ============================================================================
 
 const ICE_SERVERS = [
@@ -13,6 +14,7 @@ const ICE_SERVERS = [
 
 const CHUNK_SIZE = 16 * 1024; // 16KB — fast, reliable data-channel chunk size
 const MAX_FILES_PER_MESSAGE = 5;
+const SIGNAL_POLL_MS = 1200;
 
 class PeerLink {
   constructor({ selfId, peerId, aesKey, onMessage, onTyping, onFile, onFileProgress, onRemoteStream, onState }) {
@@ -28,59 +30,81 @@ class PeerLink {
     this.incomingFiles = new Map(); // transferId -> {meta, chunks:[]}
     this.pc = null;
     this.dc = null;
-    this.signalChannel = null;
     this.localStream = null;
-  }
-
-  // Deterministic channel name shared by both peers for a 1:1 link.
-  _signalName() {
-    return "link:" + [this.selfId, this.peerId].sort().join(":");
+    this._pollTimers = [];
+    this._appliedIceCount = 0;
+    this._answeredOfferTs = null;
+    this._prefix = "signal:" + [selfId, peerId].sort().join("__");
+    this._myIce = [];
   }
 
   async connect({ initiator }) {
     this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    this.pc.onconnectionstatechange = () => this.onState(this.pc.connectionState);
+    this.pc.onconnectionstatechange = () => {
+      this.onState(this.pc.connectionState);
+      if (this.pc.connectionState === "connected") this._stopPolling();
+    };
     this.pc.onicecandidate = (e) => {
-      if (e.candidate) this._send({ kind: "ice", candidate: e.candidate, from: this.selfId });
+      if (!e.candidate) return;
+      this._myIce.push(e.candidate.toJSON());
+      kvSet(`${this._prefix}:ice:${this.selfId}`, this._myIce).catch(() => {});
     };
     this.pc.ontrack = (e) => this.onRemoteStream && this.onRemoteStream(e.streams[0]);
-
-    this.signalChannel = DB.channel(this._signalName());
-    this.signalChannel.on("broadcast", { event: "signal" }, ({ payload }) => this._handleSignal(payload));
-    await new Promise((resolve) => this.signalChannel.subscribe((status) => status === "SUBSCRIBED" && resolve()));
 
     if (initiator) {
       this.dc = this.pc.createDataChannel("chat", { ordered: true });
       this._wireDataChannel();
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
-      this._send({ kind: "offer", sdp: offer, from: this.selfId });
+      await kvSet(`${this._prefix}:offer`, { sdp: offer, ts: Date.now() });
+      this._startPoll(() => this._pollForAnswer());
     } else {
       this.pc.ondatachannel = (e) => {
         this.dc = e.channel;
         this._wireDataChannel();
       };
+      this._startPoll(() => this._pollForOffer());
     }
+    this._startPoll(() => this._pollForRemoteIce());
   }
 
-  async _handleSignal(payload) {
-    if (payload.from === this.selfId) return;
-    if (payload.kind === "offer") {
-      await this.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-      const answer = await this.pc.createAnswer();
-      await this.pc.setLocalDescription(answer);
-      this._send({ kind: "answer", sdp: answer, from: this.selfId });
-    } else if (payload.kind === "answer") {
-      await this.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-    } else if (payload.kind === "ice") {
+  _startPoll(fn) {
+    fn();
+    const t = setInterval(fn, SIGNAL_POLL_MS);
+    this._pollTimers.push(t);
+  }
+  _stopPolling() {
+    this._pollTimers.forEach(clearInterval);
+    this._pollTimers = [];
+  }
+
+  async _pollForOffer() {
+    if (this._answeredOfferTs) return;
+    const offer = await kvGet(`${this._prefix}:offer`).catch(() => null);
+    if (!offer || offer.ts === this._answeredOfferTs) return;
+    await this.pc.setRemoteDescription(new RTCSessionDescription(offer.sdp));
+    const answer = await this.pc.createAnswer();
+    await this.pc.setLocalDescription(answer);
+    await kvSet(`${this._prefix}:answer`, { sdp: answer, ts: Date.now() });
+    this._answeredOfferTs = offer.ts;
+  }
+
+  async _pollForAnswer() {
+    if (this.pc.currentRemoteDescription) return;
+    const answer = await kvGet(`${this._prefix}:answer`).catch(() => null);
+    if (!answer) return;
+    await this.pc.setRemoteDescription(new RTCSessionDescription(answer.sdp));
+  }
+
+  async _pollForRemoteIce() {
+    const list = await kvGet(`${this._prefix}:ice:${this.peerId}`).catch(() => null);
+    if (!Array.isArray(list)) return;
+    for (let i = this._appliedIceCount; i < list.length; i++) {
       try {
-        await this.pc.addIceCandidate(payload.candidate);
+        await this.pc.addIceCandidate(list[i]);
       } catch (_) {}
     }
-  }
-
-  _send(payload) {
-    this.signalChannel.send({ type: "broadcast", event: "signal", payload });
+    this._appliedIceCount = list.length;
   }
 
   _wireDataChannel() {
@@ -154,7 +178,6 @@ class PeerLink {
 
       for (let i = 0; i < totalChunks; i++) {
         const slice = ciphertext.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-        // backpressure: wait if buffered amount gets high, keeps it snappy
         while (this.dc.bufferedAmount > 1_000_000) await new Promise((r) => setTimeout(r, 15));
         this.dc.send(JSON.stringify({ t: "file-chunk", transferId, index: i, data: Crypto._bufToB64(slice) }));
       }
@@ -168,9 +191,6 @@ class PeerLink {
     return this.localStream;
   }
 
-  // Swaps the outgoing video track for a screen-share track using
-  // replaceTrack, so the peer connection doesn't need renegotiation.
-  // Call again (or let the browser's native "stop sharing" fire) to revert.
   async toggleScreenShare(onEnded) {
     if (this._sharingScreen) {
       await this._stopScreenShare();
@@ -183,13 +203,10 @@ class PeerLink {
     this._originalVideoTrack = sender ? sender.track : null;
     this._screenStream = screenStream;
 
-    if (sender) {
-      await sender.replaceTrack(screenTrack);
-    } else {
-      this.pc.addTrack(screenTrack, screenStream);
-    }
+    if (sender) await sender.replaceTrack(screenTrack);
+    else this.pc.addTrack(screenTrack, screenStream);
+
     if (this.localStream) {
-      // Keep localStream's audio, swap in the screen track for local preview.
       this.localStream.getVideoTracks().forEach((t) => this.localStream.removeTrack(t));
       this.localStream.addTrack(screenTrack);
     }
@@ -234,10 +251,14 @@ class PeerLink {
   }
 
   close() {
+    this._stopPolling();
     if (this._screenStream) this._screenStream.getTracks().forEach((t) => t.stop());
     if (this.localStream) this.localStream.getTracks().forEach((t) => t.stop());
     if (this.dc) this.dc.close();
     if (this.pc) this.pc.close();
-    if (this.signalChannel) sb.removeChannel(this.signalChannel);
+    // Clean up signaling keys so a fresh connect() next time starts clean.
+    kvDelete(`${this._prefix}:offer`);
+    kvDelete(`${this._prefix}:answer`);
+    kvDelete(`${this._prefix}:ice:${this.selfId}`);
   }
 }
