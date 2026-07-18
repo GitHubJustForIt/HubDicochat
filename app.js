@@ -260,6 +260,20 @@ function wireComposer() {
   $("#btn-call-audio").onclick = () => startCall(false);
   $("#btn-call-video").onclick = () => startCall(true);
   $("#btn-hangup").onclick = hangUp;
+  $("#btn-share-screen").onclick = toggleScreenShare;
+}
+
+async function toggleScreenShare() {
+  const link = currentLink();
+  if (!link) return;
+  const btn = $("#btn-share-screen");
+  try {
+    const nowSharing = await link.toggleScreenShare(() => btn.classList.remove("active-share"));
+    btn.classList.toggle("active-share", nowSharing);
+    if (nowSharing) $("#local-video").srcObject = link.localStream;
+  } catch (e) {
+    // User cancelled the "choose screen/window" browser dialog — no-op.
+  }
 }
 
 function currentLink() {
