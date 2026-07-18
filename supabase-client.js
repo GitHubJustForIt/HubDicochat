@@ -29,19 +29,49 @@ const DB = {
     const { data, error } = await sb.auth.signUp({ email, password });
     if (error) throw error;
 
-    // Generate this device's E2EE identity keypair and publish the public key.
+    // Generate this device's E2EE identity keypair now (safe: local only)
+    // and stash the intended username so we can finish setting up the
+    // profile once a real session exists.
     const keys = await Crypto.generateIdentityKeyPair();
     await Crypto.storePrivateKey(data.user.id, keys.privateKeyJwk);
+    localStorage.setItem(
+      "pending_profile",
+      JSON.stringify({ id: data.user.id, username, email, publicKeyJwk: keys.publicKeyJwk })
+    );
 
-    const { error: profileErr } = await sb.from("profiles").insert({
-      id: data.user.id,
-      username,
-      email,
-      public_key: JSON.stringify(keys.publicKeyJwk),
-      status: "online",
-    });
-    if (profileErr) throw profileErr;
-    return data.user;
+    // If email confirmation is OFF, signUp() already returns an active
+    // session, so we can create the profile row right now (auth.uid() is
+    // set). If confirmation is ON, there's no session yet — RLS would
+    // reject the insert, so we skip it and finish on first sign-in instead.
+    const { data: sessionData } = await sb.auth.getSession();
+    if (sessionData.session) {
+      await DB._finishProfileSetup();
+      return { user: data.user, needsEmailConfirmation: false };
+    }
+    return { user: data.user, needsEmailConfirmation: true };
+  },
+
+  // Creates the `profiles` row from data stashed during signUp. Only ever
+  // called while a real session exists, so it satisfies the `auth.uid() = id`
+  // RLS policy on insert.
+  async _finishProfileSetup() {
+    const pending = localStorage.getItem("pending_profile");
+    if (!pending) return;
+    const { id, username, email, publicKeyJwk } = JSON.parse(pending);
+
+    const { data: sessionData } = await sb.auth.getSession();
+    if (!sessionData.session || sessionData.session.user.id !== id) return; // not this account's pending signup
+
+    const { data: alreadyExists } = await sb.from("profiles").select("id").eq("id", id).maybeSingle();
+    if (!alreadyExists) {
+      const { error } = await sb.from("profiles").insert({
+        id, username, email,
+        public_key: JSON.stringify(publicKeyJwk),
+        status: "online",
+      });
+      if (error) throw error;
+    }
+    localStorage.removeItem("pending_profile");
   },
 
   async signIn({ identifier, password }) {
@@ -57,6 +87,10 @@ const DB = {
     }
     const { data, error } = await sb.auth.signInWithPassword({ email, password });
     if (error) throw error;
+
+    // If this login is completing a signup that was waiting on email
+    // confirmation, finish creating the profile row now that a session exists.
+    await DB._finishProfileSetup();
 
     // Make sure this device has a local identity key; if not, generate one
     // and republish (first login on a new device).
