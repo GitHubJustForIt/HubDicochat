@@ -166,6 +166,9 @@
     </div>
     <p id="call-status" class="muted">Verbinde…</p>
     <div class="modal-actions">
+      <button class="icon-btn" id="btn-share-screen" title="Bildschirm teilen">
+        <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+      </button>
       <button class="btn-danger" id="btn-hangup">Auflegen</button>
     </div>
   </div>
@@ -182,7 +185,20 @@
 
 </div>
 
-<script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+<div id="boot-error" class="boot-error hidden">
+  ⚠️ Die Supabase-Bibliothek konnte nicht geladen werden (CDN-Skript blockiert oder keine Internetverbindung).
+  Bitte Internetverbindung/Adblocker prüfen und die Seite neu laden. Falls du die Datei per Doppelklick
+  (file://) geöffnet hast, starte stattdessen einen lokalen Server, z.B. <code>python3 -m http.server</code>.
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script>
+  if (typeof supabase === "undefined") {
+    document.getElementById("boot-error").classList.remove("hidden");
+    document.getElementById("auth-screen").classList.add("hidden");
+    throw new Error("Supabase SDK failed to load from CDN.");
+  }
+</script>
 <script src="supabase-client.js"></script>
 <script src="crypto.js"></script>
 <script src="webrtc.js"></script>
