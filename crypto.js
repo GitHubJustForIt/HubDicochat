@@ -142,6 +142,27 @@ const Crypto = {
     return window.crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, true, ["encrypt", "decrypt"]);
   },
 
+  // ------------------------------------------------------------ password --
+  // No backend auth service anymore — passwords are salted + hashed with
+  // PBKDF2 client-side before ever being written to the KV store. This is
+  // NOT equivalent to server-verified auth (there's no trusted server that
+  // enforces the check — a modified client could skip verification for
+  // itself), but it does mean the KV store never holds a plaintext
+  // password, and offline-cracking a leaked hash is slow (150k iterations).
+  async hashPassword(password, existingSaltB64) {
+    const enc = new TextEncoder();
+    const salt = existingSaltB64
+      ? new Uint8Array(this._b64ToBuf(existingSaltB64))
+      : window.crypto.getRandomValues(new Uint8Array(16));
+    const keyMaterial = await window.crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+    const bits = await window.crypto.subtle.deriveBits(
+      { name: "PBKDF2", salt, iterations: 150000, hash: "SHA-256" },
+      keyMaterial,
+      256
+    );
+    return { hash: this._bufToB64(bits), salt: this._bufToB64(salt.buffer) };
+  },
+
   // --------------------------------------------------------------- utils --
   _bufToB64(buf) {
     const bytes = new Uint8Array(buf);
